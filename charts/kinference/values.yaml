@@ -24,7 +24,7 @@ resources:
     memory: 2Gi
 
 # RUST_LOG; see templates/deployment.yaml for the radix_tree pin.
-logLevel: "kinference=info,dynamo_kv_router::indexer::radix_tree=error,dynamo_kv_router=warn"
+logLevel: "kinference=info,dynamo_kv_indexer::radix_tree=error,dynamo_kv_indexer=warn"
 
 # KINFERENCE_LOG_FORMAT: text, or json for one object per line.
 logFormat: text

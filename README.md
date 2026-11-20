@@ -11,7 +11,7 @@ the endpoint for that request, as well as the appropriate-mutated body.
 
 To do this, Kinference monitors vLLM KV-cache events and engine metrics.
 Kinference currently uses NVIDIA's
-[dynamo-kv-router](https://github.com/ai-dynamo/dynamo) crate to handle cache
+[Dynamo](https://github.com/ai-dynamo/dynamo) KV indexer to handle cache
 events.
 
 Kinference also monitors and sets the status on a set of Kubernetes CRDs that

@@ -7,8 +7,7 @@ you push. `just` with no argument lists every recipe.
 
 - `just lint`: `cargo fmt --check`, `cargo clippy --all-targets` with
   warnings denied, and `helm lint` on both charts.
-- `just test-unit`: `cargo test` at the workspace root. On the host it
-  needs `g++`, because the `zmq` crate compiles a bundled libzmq.
+- `just test-unit`: `cargo test` at the workspace root.
 - `just up`, `just test-smoke`, `just down`: build the image, create a
   kind cluster with both charts installed, run a CPU dummy-weights vLLM
   through `tests/e2e/smoke.sh`, and delete the cluster. The first image

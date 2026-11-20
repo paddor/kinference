@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dynamo_kv_router::indexer::KvIndexerInterface;
-use dynamo_kv_router::protocols::KvCacheEventData;
+use dynamo_kv_events::event::KvCacheEventData;
+use dynamo_kv_indexer::host::KvIndexerInterface;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
 use prometheus::{GaugeVec, IntGauge, IntGaugeVec, Opts, Registry};
@@ -286,14 +286,11 @@ mod tests;
 
 /// A `Stored` event for `worker_id` with one root block per hash.
 #[cfg(any(test, feature = "test-util"))]
-pub fn test_stored_event(
-    worker_id: u64,
-    hashes: &[u64],
-) -> dynamo_kv_router::protocols::RouterEvent {
-    use dynamo_kv_router::protocols::{
-        ExternalSequenceBlockHash, KvCacheEvent, KvCacheStoreData, KvCacheStoredBlockData,
-        LocalBlockHash, RouterEvent,
+pub fn test_stored_event(worker_id: u64, hashes: &[u64]) -> dynamo_kv_events::event::RouterEvent {
+    use dynamo_kv_events::event::{
+        KvCacheEvent, KvCacheStoreData, KvCacheStoredBlockData, RouterEvent,
     };
+    use dynamo_kv_hashing::{ExternalSequenceBlockHash, LocalBlockHash};
     RouterEvent::new(
         worker_id,
         KvCacheEvent {

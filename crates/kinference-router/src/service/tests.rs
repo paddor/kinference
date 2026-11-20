@@ -380,8 +380,8 @@ fn worker_score_maps_each_input_to_its_own_field() {
 /// Store the first `n_blocks` blocks of `tokens`, cut at `block_size`, for
 /// `worker` in the pool's radix tree, as ingest does.
 async fn store_prefix(pool: &Pool, worker: u64, tokens: &[u32], block_size: u32, n_blocks: u64) {
-    use dynamo_kv_router::protocols::WorkerWithDpRank;
-    use dynamo_kv_router::zmq_wire::{BlockHashValue, RawKvEvent, convert_event};
+    use dynamo_kv_events::zmq_wire::{BlockHashValue, RawKvEvent, convert_event};
+    use dynamo_router_protocol::worker::WorkerWithDpRank;
 
     let raw = RawKvEvent::BlockStored {
         block_hashes: (0..n_blocks)
@@ -392,11 +392,15 @@ async fn store_prefix(pool: &Pool, worker: u64, tokens: &[u32], block_size: u32,
         block_size: block_size as usize,
         medium: None,
         lora_name: None,
+        cache_namespace: None,
         block_mm_infos: None,
         is_eagle: None,
         group_idx: None,
         kv_cache_spec_kind: None,
         kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+        session_id: None,
     };
     let event = convert_event(
         raw,
@@ -404,6 +408,8 @@ async fn store_prefix(pool: &Pool, worker: u64, tokens: &[u32], block_size: u32,
         block_size,
         WorkerWithDpRank::new(worker, 0),
         &Default::default(),
+        None,
+        None,
     )
     .and_then(|e| e.into_router_event())
     .expect("a stored event");

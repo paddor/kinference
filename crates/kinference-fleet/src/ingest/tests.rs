@@ -2,8 +2,8 @@ use super::*;
 
 use std::sync::Arc;
 
-use dynamo_kv_router::protocols::{BlockHashOptions, compute_block_hash_for_seq};
-use dynamo_kv_router::zmq_wire::BlockHashValue;
+use dynamo_kv_events::zmq_wire::BlockHashValue;
+use dynamo_kv_hashing::routing::{BlockHashOptions, compute_block_hash_for_seq};
 use prometheus::{Encoder, Registry, TextEncoder};
 use tokio_util::sync::CancellationToken;
 
@@ -71,11 +71,15 @@ fn stored_in(
         block_size,
         medium: None,
         lora_name: None,
+        cache_namespace: None,
         block_mm_infos: None,
         is_eagle: None,
         group_idx,
         kv_cache_spec_kind: kind,
         kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+        session_id: None,
     }
 }
 
@@ -91,6 +95,8 @@ fn removed_in(hash: u64, group_idx: Option<u32>, kind: Option<KvCacheSpecKind>) 
         group_idx,
         kv_cache_spec_kind: kind,
         kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
     }
 }
 
@@ -427,11 +433,11 @@ async fn a_removal_without_a_kind_is_applied_after_a_reconnect() {
 
 #[test]
 fn parse_seq_payload_extracts_seq_and_payload() {
-    let msg = vec![
+    let msg = Message::multipart([
         b"topic".to_vec(),
         42u64.to_be_bytes().to_vec(),
         b"hello".to_vec(),
-    ];
+    ]);
     let (seq, payload) = parse_seq_payload(&msg).expect("3-frame msg parses");
     assert_eq!(seq, 42);
     assert_eq!(payload, b"hello");
@@ -439,21 +445,85 @@ fn parse_seq_payload_extracts_seq_and_payload() {
 
 #[test]
 fn parse_seq_payload_rejects_wrong_frame_count() {
-    assert!(parse_seq_payload(&[]).is_none());
-    assert!(parse_seq_payload(&[b"a".to_vec()]).is_none());
-    assert!(parse_seq_payload(&[b"a".to_vec(), b"b".to_vec()]).is_none());
-    let four = vec![b"a".to_vec(); 4];
+    assert!(parse_seq_payload(&Message::new()).is_none());
+    assert!(parse_seq_payload(&Message::single("a")).is_none());
+    assert!(parse_seq_payload(&Message::multipart(["a", "b"])).is_none());
+    let four = Message::multipart(["a"; 4]);
     assert!(parse_seq_payload(&four).is_none());
 }
 
 #[test]
 fn parse_seq_payload_rejects_malformed_seq() {
-    let msg = vec![
+    let msg = Message::multipart([
         b"topic".to_vec(),
         vec![1, 2, 3], // wrong length, not 8 bytes
         b"payload".to_vec(),
-    ];
+    ]);
     assert!(parse_seq_payload(&msg).is_none());
+}
+
+#[tokio::test]
+async fn live_subscription_delivers_multipart_events() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let publisher = Socket::new(SocketType::XPub, Options::default());
+        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
+        let subscriber = connect_zmq(SocketType::Sub, &endpoint.to_string())
+            .await
+            .unwrap();
+        let subscription = publisher.recv().await.unwrap();
+        assert_eq!(subscription.get(0), Some(b"\x01".as_slice()));
+
+        publisher
+            .send(Message::multipart_payloads([
+                Payload::from_slice(b"kv"),
+                Payload::from_slice(&42u64.to_be_bytes()),
+                Payload::from_slice(b"event"),
+            ]))
+            .await
+            .unwrap();
+        let event = subscriber.recv().await.unwrap();
+        assert_eq!(parse_seq_payload(&event), Some((42, b"event".as_slice())));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn clear_event_removes_every_rank_of_the_worker() {
+    let (ctx, _, _evictions) = context();
+    let mut memory = WorkerMemory::default();
+    let mut state = ListenerState {
+        cursor: CursorState::Initial,
+        memory: &mut memory,
+        warned: ListenerWarnings::default(),
+    };
+    for (rank, hash) in [(0, 10), (1, 20)] {
+        apply_batch(
+            &ctx,
+            &mut state,
+            0,
+            KvEventBatch {
+                ts: 0.0,
+                events: vec![stored(hash, 128, FULL)],
+                data_parallel_rank: Some(rank),
+            },
+        )
+        .await;
+    }
+    assert_eq!(matched(&ctx, 0, 128).await, 2);
+
+    apply_batch(
+        &ctx,
+        &mut state,
+        1,
+        KvEventBatch {
+            ts: 0.0,
+            events: vec![RawKvEvent::AllBlocksCleared { ownership: None }],
+            data_parallel_rank: Some(1),
+        },
+    )
+    .await;
+    assert_eq!(matched(&ctx, 0, 128).await, 0);
 }
 
 /// Cursor state machine: a fresh listener starts at `Initial`;
@@ -496,31 +566,6 @@ fn cursor_state_transitions_through_initial_live_gap_stale() {
         CursorObservation::Gap {
             expected: 12,
             got: 20
-        }
-    ));
-}
-
-/// After a barrier (cache Cleared event) the cursor is
-/// invalidated; the next live frame observation reports
-/// `FreshAfterBarrier` rather than `Gap`, so we don't trigger an
-/// inline replay against a barrier-invalidated history.
-#[test]
-fn barrier_invalidates_cursor_and_fresh_observation_is_not_gap() {
-    let cursor = CursorState::Live(50);
-    let invalidated = cursor.invalidate_by_barrier();
-    assert!(matches!(
-        invalidated.observe(100),
-        CursorObservation::FreshAfterBarrier {
-            got: 100,
-            last_before_barrier: Some(50)
-        }
-    ));
-    // Frames at or before the barrier are stale (don't reapply).
-    assert!(matches!(
-        invalidated.observe(50),
-        CursorObservation::Stale {
-            got: 50,
-            last_applied: Some(50)
         }
     ));
 }

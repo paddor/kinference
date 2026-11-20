@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use dynamo_kv_router::indexer::KvIndexerInterface;
+use dynamo_kv_indexer::host::KvIndexerInterface;
 use kinference_policy::PoolId;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

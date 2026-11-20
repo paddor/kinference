@@ -30,7 +30,7 @@ what it is and where its design decisions are written down.
   an endpoint picker. Designs in `docs/proposals/`. Bears on the
   picker contract and on the CRDs.
 - NVIDIA Dynamo, `ai-dynamo/dynamo` and `ai-dynamo/enhancements`. The
-  KV-aware router whose `dynamo-kv-router` crate Kinference depends on
+  KV-aware router whose KV indexer Kinference depends on
   for the radix tree. Designs in the enhancements repo under `deps/`.
   Bears on the index and on KV event ingest.
 - AIBrix, `vllm-project/aibrix`. A control plane for vLLM on

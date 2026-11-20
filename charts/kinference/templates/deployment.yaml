@@ -45,7 +45,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--config", "/etc/kinference/config.json"]
           env:
-            # The default pins dynamo_kv_router::indexer::radix_tree to error:
+            # The default pins dynamo_kv_indexer::radix_tree to error:
             # its `block_hash mismatch` warning is harmless (the tree keys on
             # tokens_hash, computed by kinference) but fires several times a
             # second. A broken chain shows on the dashboard's prefix cache row

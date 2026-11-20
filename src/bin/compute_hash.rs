@@ -1,4 +1,4 @@
-use dynamo_kv_router::protocols::{BlockHashOptions, compute_block_hash_for_seq};
+use dynamo_kv_hashing::routing::{BlockHashOptions, compute_block_hash_for_seq};
 
 /// Helper for the smoke test: given a comma-separated list of u32 tokens and a
 /// block size, print the `LocalBlockHash` values that the indexer would

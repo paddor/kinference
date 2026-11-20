@@ -152,7 +152,7 @@ The CLI. It imports `kinference-policy` and nothing else of ours.
   router.
 - The server crate imports all of the above.
 
-`kube`, `reqwest`, `tonic`, `axum` and `zmq` stay at the edges. Decision
+`kube`, `reqwest`, `tonic`, `axum` and `omq-tokio` stay at the edges. Decision
 logic takes data and returns data.
 
 ## Cross-cutting concerns

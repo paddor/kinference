@@ -10,14 +10,12 @@
 FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm AS builder
 ARG TARGETARCH
 
-# The `zmq` crate compiles a bundled libzmq with g++; cargo needs git for the
-# `dynamo-kv-router` dep.
+# Cargo needs git for the Dynamo Rust dependencies.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
-        g++ \
-        g++-x86-64-linux-gnu libc6-dev-amd64-cross \
-        g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+        gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
+        gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/*
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc

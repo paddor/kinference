@@ -96,7 +96,7 @@ async fn the_body_counts_pools_with_ready_endpoints() {
 /// and the worker health.
 #[tokio::test]
 async fn the_first_scrape_shows_the_fleet_gauges_with_no_task_running() {
-    use dynamo_kv_router::indexer::KvIndexerInterface;
+    use dynamo_kv_indexer::host::KvIndexerInterface;
 
     let registry = PoolRegistry::new();
     let p = pool("warm");

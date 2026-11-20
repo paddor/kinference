@@ -8,10 +8,9 @@ same loop, through the recipes in the [justfile](../justfile).
 ## What you need
 
 `docker`, `kind`, `kubectl`, `helm` and `just`. Docker builds the image,
-so you need the Rust toolchain only for `just lint` and `just test-unit`;
-on the host those two also need `g++`.
+so you need the Rust toolchain only for `just lint` and `just test-unit`.
 
-The first `just image` compiles the `dynamo-kv-router` git dependency and
+The first `just image` compiles the Dynamo Rust dependencies and
 takes a while; BuildKit cache mounts keep later builds incremental. The
 worker below pulls a CPU vLLM image of about 600 MB and requests 500m CPU
 and 1 GiB of memory.
@@ -146,7 +145,7 @@ helm upgrade kinference charts/kinference --reuse-values \
 ```
 
 The same command sets the chart's other knobs: `logLevel` sets `RUST_LOG`
-(`kinference=trace,dynamo_kv_router=trace` for KV-event debugging),
+(`kinference=trace,dynamo_kv_indexer=trace` for KV-event debugging),
 `logFormat` sets `KINFERENCE_LOG_FORMAT` to `text` or `json`, and
 `enableReplay` makes Kinference fetch the event history on attach.
 
@@ -171,7 +170,7 @@ on commas, so the commas inside `logLevel` need a backslash:
 ```sh
 helm upgrade kinference charts/kinference --reuse-values \
   --set logFormat=json \
-  --set logLevel='kinference=info\,kinference::observation=debug\,dynamo_kv_router::indexer::radix_tree=error\,dynamo_kv_router=warn'
+  --set logLevel='kinference=info\,kinference::observation=debug\,dynamo_kv_indexer::radix_tree=error\,dynamo_kv_indexer=warn'
 ```
 
 The events go wherever the cluster's log pipeline sends the pod's output.

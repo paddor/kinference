@@ -11,8 +11,8 @@ use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dynamo_kv_router::indexer::KvIndexerInterface;
-use dynamo_kv_router::protocols::{BlockHashOptions, compute_block_hash_for_seq};
+use dynamo_kv_hashing::routing::{BlockHashOptions, compute_block_hash_for_seq};
+use dynamo_kv_indexer::host::KvIndexerInterface;
 use kinference_policy::AUTO_MODEL;
 
 use crate::body_store::{self, Bodies, BodyLimits};

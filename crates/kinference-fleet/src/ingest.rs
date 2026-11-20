@@ -1,7 +1,7 @@
 //! Per-worker ZMQ ingest listener for vLLM KV-cache events.
 //!
 //! One [`spawn_worker_listener`] task per worker. Each task owns its sockets,
-//! parses vLLM's wire-format events through `dynamo_kv_router::zmq_wire`, and
+//! parses vLLM's wire-format events through `dynamo_kv_events::zmq_wire`, and
 //! feeds them into the pool's `KvIndexer` (radix tree) and our bookkeeping
 //! (`InflightPrefixes`, `FleetMetrics`, `WorkerRegistry`), all reached
 //! through the [`WorkerContext`], in `apply_frame`.
@@ -15,30 +15,28 @@
 //! listener never waits for a seq the publisher has already passed.
 //!
 //! Sequence-cursor semantics come from
-//! [`dynamo_kv_router::recovery::CursorState`]. The ZMQ socket helpers are
-//! reimplemented here because dynamo's are `pub(super)`.
+//! [`dynamo_kv_events::cursor::CursorState`].
 use std::error::Error as StdError;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
-use dynamo_kv_router::indexer::KvIndexerInterface;
-use dynamo_kv_router::protocols::{KvCacheEvent, KvCacheEventData, RouterEvent, WorkerWithDpRank};
-use dynamo_kv_router::recovery::{CursorObservation, CursorState};
-use dynamo_kv_router::zmq_wire::{
+use dynamo_kv_events::cursor::{CursorObservation, CursorState};
+use dynamo_kv_events::event::{KvCacheEventData, RouterEvent};
+use dynamo_kv_events::zmq_wire::{
     KvCacheSpecKind, KvEventBatch, RawKvEvent, ZmqEventFilterReason, ZmqEventNormalizer,
     convert_event, decode_event_batch,
 };
-use tokio::io::unix::AsyncFd;
+use dynamo_kv_indexer::host::KvIndexerInterface;
+use dynamo_router_protocol::worker::WorkerWithDpRank;
+use omq_tokio::{KeepAlive, Message, Options, Payload, ReconnectPolicy, Socket, SocketType};
 
 use crate::error::Error;
 use crate::metrics::IngestEvent;
 use crate::pool::WorkerContext;
 use crate::workers::{AttentionKind, IndexedGroup};
 
-/// Per-recv DEALER timeout, keeping the replay loop responsive.
-const REPLAY_DEALER_RCVTIMEO_MS: i32 = 500;
+const REPLAY_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Default wall-clock budget for one `replay_gap` call, when
 /// `replay_timeout_ms` is unset.
@@ -298,14 +296,14 @@ async fn run_listener(
     let live_endpoint = cfg.zmq_endpoint.clone().ok_or(Error::NoZmqEndpoint)?;
     let replay_endpoint = cfg.replay_endpoint.clone();
 
-    let mut sub = ZmqSocket::sub(&live_endpoint, &worker_id_str)?;
+    let sub = connect_zmq(SocketType::Sub, &live_endpoint).await?;
     // With replay off, live ingest still flows, but history is never fetched
     // and gaps aren't recovered.
-    let mut replay = if !ingest.replay {
+    let replay = if !ingest.replay {
         None
     } else {
         match replay_endpoint.as_deref() {
-            Some(endpoint) => Some(ZmqSocket::dealer(endpoint, &worker_id_str)?),
+            Some(endpoint) => Some(connect_zmq(SocketType::Dealer, endpoint).await?),
             None => {
                 tracing::warn!(
                     worker_id = worker_id_str,
@@ -378,8 +376,9 @@ async fn run_listener(
                 }
                 continue;
             }
-            recv = sub.recv_multipart() => {
-                let msg = recv?;
+            recv = sub.recv() => {
+                let msg = recv.map_err(zmq("receive live events"))?;
+                tokio::task::consume_budget().await;
                 frames_seen += 1;
                 let (seq, payload) = match parse_seq_payload(&msg) {
                     Some(p) => p,
@@ -406,7 +405,7 @@ async fn run_listener(
                     &mut state,
                     seq,
                     payload,
-                    replay.as_mut(),
+                    replay.as_ref(),
                     replay_wall_budget,
                 )
                 .await;
@@ -422,11 +421,11 @@ async fn handle_observation(
     state: &mut ListenerState<'_>,
     seq: u64,
     payload: &[u8],
-    replay: Option<&mut ZmqSocket>,
+    replay: Option<&Socket>,
     replay_wall_budget: Duration,
 ) {
     let worker_id_str = &ctx.cfg.worker_id_str;
-    match state.cursor.observe(seq) {
+    let replay_start = match state.cursor.observe(seq) {
         CursorObservation::Initial { got } if got > 0 => {
             // First frame, at a non-zero seq: drain `[0, got)` first.
             tracing::debug!(
@@ -435,9 +434,7 @@ async fn handle_observation(
                 end_seq = got,
                 "replaying KV events up to the first live one"
             );
-            if let Some(dealer) = replay {
-                replay_gap(ctx, state, dealer, 0, got, replay_wall_budget).await;
-            }
+            Some(0)
         }
         CursorObservation::Gap { expected, got } => {
             if !std::mem::replace(&mut state.warned.gap, true) {
@@ -457,9 +454,7 @@ async fn handle_observation(
                     "gap in event stream; inline replay"
                 );
             }
-            if let Some(dealer) = replay {
-                replay_gap(ctx, state, dealer, expected, got, replay_wall_budget).await;
-            }
+            Some(expected)
         }
         CursorObservation::Stale { got, last_applied } => {
             // Already applied.
@@ -471,10 +466,12 @@ async fn handle_observation(
             );
             return;
         }
-        CursorObservation::Initial { .. }
-        | CursorObservation::Contiguous { .. }
-        | CursorObservation::FreshAfterBarrier { .. } => {
-            // Apply normally, advance.
+        CursorObservation::Initial { .. } | CursorObservation::Contiguous { .. } => None,
+    };
+    if let (Some(dealer), Some(start)) = (replay, replay_start) {
+        replay_gap(ctx, state, dealer, start, seq, replay_wall_budget).await;
+        if ctx.cancel.is_cancelled() {
+            return;
         }
     }
 
@@ -492,7 +489,7 @@ async fn handle_observation(
 async fn replay_gap(
     ctx: &WorkerContext,
     state: &mut ListenerState<'_>,
-    dealer: &mut ZmqSocket,
+    dealer: &Socket,
     start_seq: u64,
     end_seq: u64,
     replay_wall_budget: Duration,
@@ -502,8 +499,14 @@ async fn replay_gap(
     // ROUTER prepends our identity and replies with batches of
     // [identity_or_delim, seq_be_u64, payload]. An empty payload
     // signals end-of-replay.
-    let req = [vec![], start_seq.to_be_bytes().to_vec()];
-    if let Err(err) = dealer.send_multipart(&req).await {
+    let start = start_seq.to_be_bytes();
+    let req = Message::multipart_payloads([Payload::new(), Payload::from_slice(&start)]);
+    let sent = tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => return,
+        result = tokio::time::timeout(REPLAY_SEND_TIMEOUT, dealer.send(req)) => result,
+    };
+    if let Err(err) = sent.unwrap_or(Err(omq_tokio::Error::Timeout)) {
         if !std::mem::replace(&mut state.warned.replay, true) {
             tracing::warn!(
                 worker_id = worker_id_str,
@@ -522,17 +525,23 @@ async fn replay_gap(
     let mut sentinel_seen = false;
 
     loop {
-        if started.elapsed() >= replay_wall_budget {
+        let remaining = replay_wall_budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             wall_budget_hit = true;
             break;
         }
-        let msg = match dealer
-            .recv_multipart_with_timeout(Duration::from_millis(REPLAY_DEALER_RCVTIMEO_MS as u64))
-            .await
-        {
-            Ok(Some(m)) => m,
-            Ok(None) => continue, // recv timeout; keep waiting until wall budget
-            Err(err) => {
+        let received = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return,
+            result = tokio::time::timeout(remaining, dealer.recv()) => result,
+        };
+        let msg = match received {
+            Ok(Ok(msg)) => msg,
+            Err(_) => {
+                wall_budget_hit = true;
+                break;
+            }
+            Ok(Err(err)) => {
                 if !std::mem::replace(&mut state.warned.replay, true) {
                     tracing::warn!(
                         worker_id = worker_id_str,
@@ -561,7 +570,7 @@ async fn replay_gap(
             sentinel_seen = true;
             break;
         }
-        let Ok(seq_bytes) = <[u8; 8]>::try_from(msg[1].as_slice()) else {
+        let Ok(seq_bytes) = <[u8; 8]>::try_from(&msg[1]) else {
             tracing::trace!(
                 worker_id = worker_id_str,
                 len = msg[1].len(),
@@ -577,9 +586,7 @@ async fn replay_gap(
             CursorObservation::Stale { .. } => {
                 continue;
             }
-            CursorObservation::Initial { .. }
-            | CursorObservation::Contiguous { .. }
-            | CursorObservation::FreshAfterBarrier { .. } => {}
+            CursorObservation::Initial { .. } | CursorObservation::Contiguous { .. } => {}
             CursorObservation::Gap { .. } => {
                 // Ahead of the cursor: accept it; a later observation
                 // retries the gap.
@@ -637,12 +644,12 @@ async fn replay_gap(
 /// Extract `(seq, payload)` from a 3-frame ZMQ message
 /// `[topic_or_identity, seq_be_u64, payload]`. Returns `None` if the
 /// shape is malformed; the caller logs and drops.
-fn parse_seq_payload(msg: &[Vec<u8>]) -> Option<(u64, &[u8])> {
+fn parse_seq_payload(msg: &Message) -> Option<(u64, &[u8])> {
     if msg.len() != 3 {
         return None;
     }
-    let seq_bytes = <[u8; 8]>::try_from(msg[1].as_slice()).ok()?;
-    Some((u64::from_be_bytes(seq_bytes), msg[2].as_slice()))
+    let seq_bytes = <[u8; 8]>::try_from(&msg[1]).ok()?;
+    Some((u64::from_be_bytes(seq_bytes), &msg[2]))
 }
 
 // --- Bookkeeping ------------------------------------------------------
@@ -716,7 +723,6 @@ async fn apply_batch(
                 select_group(
                     ctx,
                     state.memory,
-                    seq,
                     group_idx,
                     *kv_cache_spec_kind,
                     *block_size,
@@ -743,6 +749,8 @@ async fn apply_batch(
             block_size,
             worker,
             &state.memory.convert_warnings,
+            None,
+            None,
         ) else {
             continue;
         };
@@ -756,7 +764,7 @@ async fn apply_batch(
                 // Once a dispatch's blocks are all stored it drops out, and
                 // the radix tree is the sole signal.
                 //
-                // Match on `tokens_hash` (dynamo-kv-router's XXH3 over the
+                // Match on `tokens_hash` (Dynamo's XXH3 over the
                 // event's token ids), not `block_hash` (the engine's hash):
                 // `InflightPrefixes` is populated from
                 // `compute_block_hash_for_seq` in `score_workers`, which uses
@@ -768,7 +776,10 @@ async fn apply_batch(
                 (IngestEvent::Stored, d.blocks.len() as u64)
             }
             KvCacheEventData::Removed(d) => (IngestEvent::Removed, d.block_hashes.len() as u64),
-            KvCacheEventData::Cleared => (IngestEvent::Cleared, 0),
+            KvCacheEventData::Cleared => {
+                clear_worker_blocks(ctx).await;
+                continue;
+            }
         };
         ctx.prom.record_index_event(ev_kind, n_blocks);
         ctx.indexer.apply_event(router_event).await;
@@ -834,7 +845,6 @@ fn classify(indexed: Option<IndexedGroup>, group_idx: u32, block_size: u32) -> V
 async fn select_group(
     ctx: &WorkerContext,
     memory: &mut WorkerMemory,
-    seq: u64,
     group_idx: u32,
     kind: Option<KvCacheSpecKind>,
     block_size: usize,
@@ -860,7 +870,7 @@ async fn select_group(
 
     // The worker's blocks belong to the old group or the old block size.
     if memory.indexed.is_some() {
-        clear_worker_blocks(ctx, seq).await;
+        clear_worker_blocks(ctx).await;
         memory.stored_indexed = false;
     }
     let group = IndexedGroup {
@@ -881,19 +891,11 @@ async fn select_group(
     None
 }
 
-/// Remove every block of the worker from the radix tree. The clear goes
-/// through the event channel, so it stays ahead of the `BlockStored` event
-/// that follows it.
-async fn clear_worker_blocks(ctx: &WorkerContext, seq: u64) {
-    let cleared = KvCacheEvent {
-        event_id: seq,
-        data: KvCacheEventData::Cleared,
-        dp_rank: 0,
-    };
+/// Clear every rank of the worker. Removals and events share the indexer's
+/// mutation queue, so a subsequent `BlockStored` remains ordered behind this.
+async fn clear_worker_blocks(ctx: &WorkerContext) {
     ctx.prom.record_index_event(IngestEvent::Cleared, 0);
-    ctx.indexer
-        .apply_event(RouterEvent::new(ctx.cfg.worker_id_num, cleared))
-        .await;
+    ctx.indexer.remove_worker(ctx.cfg.worker_id_num).await;
 }
 
 fn attention_kind(kind: KvCacheSpecKind) -> Option<AttentionKind> {
@@ -945,11 +947,7 @@ fn log_event(worker_id_str: &str, seq: u64, router_event: &RouterEvent) {
     }
 }
 
-// --- ZMQ socket helpers ---------------------------------------------
-//
-// Tokio wrappers over `zmq::Socket` (dynamo's are `pub(super)`): register
-// the socket's fd with `AsyncFd`, and check `get_events()` for actual
-// readiness, since the fd alone isn't reliable.
+// --- ZMQ socket setup --------------------------------------------------
 
 /// How often the KV-event listener re-checks its own liveness. Cheap; the
 /// reporting below is what decides whether anything is said.
@@ -961,212 +959,36 @@ const SUB_IDLE_WARN_AFTER: Duration = Duration::from_secs(300);
 /// A listener that ran this long before failing counts as having recovered,
 /// so its next failure warns again.
 const LISTENER_HEALTHY_AFTER: Duration = Duration::from_secs(60);
-const ZMQ_SUB_RCVTIMEO_MS: i32 = 100;
-const ZMQ_RECONNECT_IVL_MS: i32 = 100;
-const ZMQ_RECONNECT_IVL_MAX_MS: i32 = 5_000;
-const ZMQ_HEARTBEAT_IVL_MS: i32 = 10_000;
-const ZMQ_HEARTBEAT_TIMEOUT_MS: i32 = 20_000;
-const ZMQ_SUB_RCVHWM: i32 = 100_000;
-const ZMQ_DEALER_SNDTIMEO_MS: i32 = 3_000;
-const ZMQ_LINGER_MS: i32 = 0;
-const TCP_KEEPALIVE_IDLE_SECS: i32 = 60;
-const TCP_KEEPALIVE_INTVL_SECS: i32 = 30;
-const TCP_KEEPALIVE_CNT: i32 = 3;
-
-/// Tokio-driven wrapper around `zmq::Socket`.
-struct ZmqSocket {
-    inner: AsyncFd<SocketWrapper>,
-}
-
-/// The socket plus its raw fd (owned by the socket), for `AsyncFd`.
-struct SocketWrapper {
-    socket: zmq::Socket,
-    fd: RawFd,
-}
-
-impl AsRawFd for SocketWrapper {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
-/// `map_err` adapters that name the failed call.
-fn zmq(op: &'static str) -> impl Fn(zmq::Error) -> Error {
+fn zmq(op: &'static str) -> impl Fn(omq_tokio::Error) -> Error {
     move |source| Error::Zmq { op, source }
 }
 
-fn io(op: &'static str) -> impl Fn(std::io::Error) -> Error {
-    move |source| Error::Io { op, source }
+async fn connect_zmq(kind: SocketType, endpoint: &str) -> Result<Socket, Error> {
+    let mut options = Options::default()
+        .tcp_keepalive(KeepAlive::Enabled {
+            idle: Duration::from_secs(60),
+            intvl: Duration::from_secs(30),
+            cnt: 3,
+        })
+        .heartbeat_interval(Duration::from_secs(10))
+        .heartbeat_timeout(Duration::from_secs(20))
+        .reconnect(ReconnectPolicy::Exponential {
+            min: Duration::from_millis(100),
+            max: Duration::from_secs(5),
+        });
+    if kind == SocketType::Sub {
+        options = options.recv_hwm(100_000);
+    }
+    let socket = Socket::new(kind, options);
+    if kind == SocketType::Sub {
+        socket
+            .subscribe(b"".as_slice())
+            .await
+            .map_err(zmq("subscribe to live events"))?;
+    }
+    socket.connect(endpoint).await.map_err(zmq("connect"))?;
+    Ok(socket)
 }
-
-impl ZmqSocket {
-    fn sub(endpoint: &str, worker_id: &str) -> Result<Self, Error> {
-        let ctx = zmq::Context::new();
-        let socket = ctx.socket(zmq::SUB).map_err(zmq("creating SUB socket"))?;
-        socket
-            .set_subscribe(b"")
-            .map_err(zmq("SUB set_subscribe(empty)"))?;
-        socket
-            .set_rcvtimeo(ZMQ_SUB_RCVTIMEO_MS)
-            .map_err(zmq("SUB set_rcvtimeo"))?;
-        socket
-            .set_rcvhwm(ZMQ_SUB_RCVHWM)
-            .map_err(zmq("SUB set_rcvhwm"))?;
-        apply_socket_robustness(&socket, worker_id, "SUB");
-        socket.connect(endpoint).map_err(zmq("SUB connect"))?;
-        Self::wrap(socket)
-    }
-
-    fn dealer(endpoint: &str, worker_id: &str) -> Result<Self, Error> {
-        let ctx = zmq::Context::new();
-        let socket = ctx
-            .socket(zmq::DEALER)
-            .map_err(zmq("creating DEALER socket"))?;
-        socket
-            .set_sndtimeo(ZMQ_DEALER_SNDTIMEO_MS)
-            .map_err(zmq("DEALER set_sndtimeo"))?;
-        socket
-            .set_rcvtimeo(REPLAY_DEALER_RCVTIMEO_MS)
-            .map_err(zmq("DEALER set_rcvtimeo"))?;
-        socket
-            .set_linger(ZMQ_LINGER_MS)
-            .map_err(zmq("DEALER set_linger"))?;
-        apply_socket_robustness(&socket, worker_id, "DEALER");
-        socket.connect(endpoint).map_err(zmq("DEALER connect"))?;
-        Self::wrap(socket)
-    }
-
-    fn wrap(socket: zmq::Socket) -> Result<Self, Error> {
-        let fd = socket.get_fd().map_err(zmq("socket get_fd"))?;
-        let wrapper = SocketWrapper { socket, fd };
-        let inner = AsyncFd::new(wrapper).map_err(io("AsyncFd::new"))?;
-        Ok(Self { inner })
-    }
-
-    async fn recv_multipart(&mut self) -> Result<Vec<Vec<u8>>, Error> {
-        loop {
-            // ZMQ's fd is edge-triggered. The traces distinguish three ways
-            // a listener can go quiet:
-            //
-            //   no `fd readable` at all  the fd never signals; the socket may
-            //                            not be peered.
-            //   readable, no POLLIN      woken with nothing queued: no
-            //                            publisher, or no subscription.
-            //   POLLIN then EAGAIN       the edge-trigger race.
-            let mut guard = self
-                .inner
-                .readable_mut()
-                .await
-                .map_err(io("AsyncFd readable"))?;
-            tracing::trace!("ZMQ fd readable");
-            // Not actually ready: clear the readiness and wait again.
-            let events = guard
-                .get_inner_mut()
-                .socket
-                .get_events()
-                .map_err(zmq("zmq get_events"))?;
-            if !events.contains(zmq::POLLIN) {
-                tracing::trace!(events = events.bits(), "ZMQ fd readable without POLLIN");
-                guard.clear_ready();
-                continue;
-            }
-            match guard.get_inner_mut().socket.recv_multipart(zmq::DONTWAIT) {
-                Ok(msg) => {
-                    tracing::trace!(frames = msg.len(), "ZMQ frame received");
-                    return Ok(msg);
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    tracing::trace!("ZMQ recv returned EAGAIN after POLLIN");
-                    guard.clear_ready();
-                    continue;
-                }
-                Err(source) => return Err(Error::Zmq { op: "recv", source }),
-            }
-        }
-    }
-
-    /// Like [`Self::recv_multipart`] but returns `Ok(None)` if the
-    /// `timeout` elapses with no frame available. Cancellation-safe.
-    async fn recv_multipart_with_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<Vec<Vec<u8>>>, Error> {
-        match tokio::time::timeout(timeout, self.recv_multipart()).await {
-            Ok(Ok(msg)) => Ok(Some(msg)),
-            Ok(Err(err)) => Err(err),
-            Err(_) => Ok(None),
-        }
-    }
-
-    async fn send_multipart(&mut self, frames: &[Vec<u8>]) -> Result<(), Error> {
-        if frames.is_empty() {
-            return Ok(());
-        }
-        let last = frames.len() - 1;
-        for (i, frame) in frames.iter().enumerate() {
-            let flags = if i == last {
-                zmq::DONTWAIT
-            } else {
-                zmq::SNDMORE | zmq::DONTWAIT
-            };
-            loop {
-                let mut guard = self
-                    .inner
-                    .writable_mut()
-                    .await
-                    .map_err(io("AsyncFd writable"))?;
-                let events = guard
-                    .get_inner_mut()
-                    .socket
-                    .get_events()
-                    .map_err(zmq("zmq get_events"))?;
-                if !events.contains(zmq::POLLOUT) {
-                    guard.clear_ready();
-                    continue;
-                }
-                match guard.get_inner_mut().socket.send(&frame[..], flags) {
-                    Ok(()) => break,
-                    Err(zmq::Error::EAGAIN) => {
-                        guard.clear_ready();
-                        continue;
-                    }
-                    Err(source) => return Err(Error::Zmq { op: "send", source }),
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Socket robustness for streams over an L4 load balancer (e.g. AWS NLB):
-///
-/// 1. OS TCP keepalive, against half-open connections: probes after 60s
-///    idle, then every 30s, dropping after 3. Within NLB's 350s idle timeout.
-/// 2. ZMTP 3.1 heartbeats (libzmq 4.2.0+ on both peers): an unresponsive
-///    peer's connection is rebuilt.
-/// 3. Reconnect backoff capped at 5s.
-///
-/// Option errors are not fatal. Must be called before `connect()`.
-fn apply_socket_robustness(socket: &zmq::Socket, worker_id: &str, kind: &str) {
-    let _ = socket.set_tcp_keepalive(1);
-    let _ = socket.set_tcp_keepalive_idle(TCP_KEEPALIVE_IDLE_SECS);
-    let _ = socket.set_tcp_keepalive_intvl(TCP_KEEPALIVE_INTVL_SECS);
-    let _ = socket.set_tcp_keepalive_cnt(TCP_KEEPALIVE_CNT);
-    let _ = socket.set_heartbeat_ivl(ZMQ_HEARTBEAT_IVL_MS);
-    let _ = socket.set_heartbeat_timeout(ZMQ_HEARTBEAT_TIMEOUT_MS);
-    let _ = socket.set_reconnect_ivl(ZMQ_RECONNECT_IVL_MS);
-    if let Err(err) = socket.set_reconnect_ivl_max(ZMQ_RECONNECT_IVL_MAX_MS) {
-        tracing::warn!(
-            worker_id,
-            socket = kind,
-            error = &err as &dyn StdError,
-            "failed to set the ZMQ reconnect interval"
-        );
-    }
-}
-
-// Sockets close when the listener task ends. `ZMQ_LINGER_MS=0` on DEALER
-// means closing doesn't block on pending sends.
 
 #[cfg(test)]
 mod tests;

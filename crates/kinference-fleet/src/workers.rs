@@ -47,7 +47,7 @@ fn host_port_from_http_url(url: &str) -> Option<String> {
     (!authority.is_empty()).then(|| authority.to_string())
 }
 
-/// A pool's workers, keyed by the numeric `WorkerId` `dynamo-kv-router` uses.
+/// A pool's workers, keyed by the numeric `WorkerId` Dynamo uses.
 ///
 /// `by_model` is populated from each worker's `/v1/models` scrape (via
 /// [`Self::set_served_models`]); a worker may serve several models (LoRA
@@ -110,7 +110,7 @@ pub struct WorkerEntry {
     /// the worker's first `BlockStored` event.
     pub indexed_group: Option<IndexedGroup>,
     /// True once the ZMQ listener has finished its initial replay-drain and is
-    /// receiving live. Part of [`Self::is_ready`]. Sticky across libzmq
+    /// receiving live. Part of [`Self::is_ready`]. Sticky across socket
     /// reconnects.
     pub initial_sync_complete: bool,
     /// True once kinference has decoded a KV cache event from this worker (see

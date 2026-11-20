@@ -1,5 +1,5 @@
 use super::*;
-use dynamo_kv_router::indexer::KvIndexerInterface;
+use dynamo_kv_indexer::host::KvIndexerInterface;
 
 fn cfg(name: &str) -> PoolSpec {
     crate::pool::test_spec(name)

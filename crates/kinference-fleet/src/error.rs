@@ -13,12 +13,7 @@ pub enum Error {
     /// A ZMQ call failed; `op` names it.
     Zmq {
         op: &'static str,
-        source: zmq::Error,
-    },
-    /// Registering or waiting on the socket fd with tokio failed.
-    Io {
-        op: &'static str,
-        source: std::io::Error,
+        source: omq_tokio::Error,
     },
     /// A worker's `/metrics` or `/v1/models` request failed.
     Http { url: String, source: reqwest::Error },
@@ -43,7 +38,6 @@ impl std::fmt::Display for Error {
             ),
             Error::NoZmqEndpoint => f.write_str("worker has no zmq_endpoint configured"),
             Error::Zmq { op, .. } => write!(f, "zmq: {op}"),
-            Error::Io { op, .. } => write!(f, "socket fd: {op}"),
             Error::Http { url, .. } => write!(f, "GET {url}"),
             Error::HttpStatus { url, status } => write!(f, "GET {url}: HTTP {status}"),
             Error::MetricsParse { url, .. } => write!(f, "parsing Prometheus body from {url}"),
@@ -67,7 +61,6 @@ impl std::error::Error for Error {
             | Error::HttpStatus { .. }
             | Error::WorkerSetsFailed(_) => None,
             Error::Zmq { source, .. } => Some(source),
-            Error::Io { source, .. } => Some(source),
             Error::Http { source, .. } => Some(source),
             Error::MetricsParse { source, .. } => Some(source),
         }

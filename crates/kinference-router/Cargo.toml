@@ -9,7 +9,8 @@ license.workspace = true
 [dependencies]
 kinference-policy.workspace = true
 kinference-fleet.workspace = true
-dynamo-kv-router.workspace = true
+dynamo-kv-hashing.workspace = true
+dynamo-kv-indexer.workspace = true
 tonic.workspace = true
 prost = "0.14"
 tonic-prost = "0.14"
@@ -36,6 +37,8 @@ chrono.workspace = true
 getrandom.workspace = true
 
 [dev-dependencies]
+dynamo-kv-events.workspace = true
+dynamo-router-protocol.workspace = true
 kinference-policy = { workspace = true, features = ["test-util"] }
 kinference-fleet = { workspace = true, features = ["test-util"] }
 # `net` and axum for the fake `/render` server.

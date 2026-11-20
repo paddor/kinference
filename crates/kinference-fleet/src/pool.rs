@@ -29,7 +29,7 @@ use std::error::Error as StdError;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use dynamo_kv_router::indexer::{KvIndexer, KvIndexerMetrics};
+use dynamo_kv_indexer::host::{KvIndexer, KvIndexerMetrics};
 use kinference_policy::{PoolId, PoolKey};
 use tokio_util::sync::CancellationToken;
 
